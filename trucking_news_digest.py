@@ -17,6 +17,7 @@ Environment variables (email only):
 import html
 import json
 import os
+import re
 import smtplib
 import time
 import urllib.parse
@@ -35,22 +36,31 @@ FETCH_HOURS = 48           # ignore feed items older than this
 MAX_EMAIL_ITEMS = 40
 
 SEARCH_QUERIES = [
-    "FMCSA",
-    "trucking regulations",
-    "truck drivers new rule",
-    "ELD mandate",
-    "hours of service",
-    "CDL English proficiency",
-    "non-domiciled CDL",
-    "DOT inspection enforcement",
-    "CVSA inspection",
-    "truck parking",
-    "diesel prices",
-    "freight rates trucking",
-    "Amazon Relay",
-    "trucking fraud scam alert",
-    "highway closure trucks",
-    "truck weigh station",
+    '"FMCSA"',
+    'trucking regulations',
+    '"truck drivers" new rule',
+    '"ELD" trucking',
+    '"hours of service" truckers',
+    '"CDL" truck drivers',
+    '"non-domiciled CDL"',
+    'DOT inspection trucks',
+    '"CVSA" inspection',
+    '"truck parking"',
+    '"diesel prices" truckers',
+    '"freight rates" trucking',
+    '"Amazon Relay"',
+    'trucking fraud scam',
+    'semi truck crash highway closed',
+    'weigh station trucks',
+    # Road closures and conditions
+    'interstate closed flooding',
+    'interstate shut down',
+    'interstate closure crash',
+    'highway closed snow ice',
+    'wildfire closes interstate',
+    'chain control requirements',
+    'rollover crash interstate',
+    'jackknifed semi interstate',
 ]
 
 # Verify each URL still works; remove any that fail.
@@ -58,10 +68,65 @@ DIRECT_FEEDS = [
     "https://www.freightwaves.com/news/feed",
 ]
 
+# An item is kept only if its title/summary contains one of these words...
 KEYWORDS = [
-    "fmcsa", "dot", "cdl", "eld", "hours of service", "truck", "trucking",
-    "driver", "freight", "diesel", "inspection", "cvsa", "safety", "rule",
+    "truck", "trucks", "trucking", "trucker", "truckers", "semi", "semis",
+    "tractor-trailer", "18-wheeler", "freight", "fmcsa", "cdl", "eld", "elds",
+    "diesel", "hours of service", "cvsa", "weigh station", "dot", "nhtsa",
+    "amazon relay", "load board", "reefer", "flatbed", "owner-operator",
+    "drayage", "ifta", "truck parking", "truckload", "ltl", "less-than-truckload",
+    "freightliner", "peterbilt", "kenworth", "intermodal",
 ]
+
+# ...and none of these.
+EXCLUDE = [
+    "food truck", "trunk-or-treat", "trunk or treat", "truck-or-treat",
+    "truck or treat", "touch-a-truck", "touch a truck", "halloween",
+    "pickup truck", "monster truck", "ice cream truck", "fire truck",
+    "gasoline", "gas prices", "mortgage", "stock",
+    # Non-US places
+    "canada", "canadian", "ontario", "british columbia", "alberta", "quebec",
+    "manitoba", "saskatchewan", "toronto", "vancouver", "saanich", "victoria, bc",
+    "cuba", "india", "united kingdom", "london", "australia", "pakistan",
+    "nigeria", "kenya", "philippines", "china", "ukraine", "germany",
+]
+
+KEYWORD_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in KEYWORDS) + r")\b", re.I)
+EXCLUDE_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in EXCLUDE) + r"|uk)\b", re.I)
+
+
+# Road closures/conditions: a US-style road name AND an event word in the title.
+ROAD_RE = re.compile(r"\b(I-\d{1,3}|Interstate \d{1,3}|US-\d{1,3}|US Highway \d{1,3}|SR-\d{1,3}|State Route \d{1,3})\b", re.I)
+PLAIN_HWY_RE = re.compile(r"\bHighway \d{1,3}\b", re.I)
+US_STATES = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut",
+    "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa",
+    "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan",
+    "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York", "North Carolina",
+    "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+]
+STATE_RE = re.compile(r"\b(" + "|".join(US_STATES) + r")\b", re.I)
+EVENT_RE = re.compile(
+    r"\b(closed|closure|closures|shut down|shutdown|flood|flooding|flooded|crash|wreck|"
+    r"snow|ice|icy|blizzard|wildfire|detour|detours|rollover|jackknife|jackknifed|"
+    r"chain controls?|reopens|reopened|standstill|backed up|landslide|rockslide|"
+    r"washed out|high winds|dust storm)\b", re.I)
+
+
+def is_relevant(title, summary=""):
+    if EXCLUDE_RE.search(title):
+        return False
+    text = title + " " + summary
+    if KEYWORD_RE.search(text):
+        return True
+    if not EVENT_RE.search(title):
+        return False
+    if ROAD_RE.search(title):
+        return True
+    return bool(PLAIN_HWY_RE.search(title) and STATE_RE.search(title))
 
 
 def google_news_url(query):
@@ -72,11 +137,6 @@ def google_news_url(query):
 def entry_time(entry):
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     return time.mktime(parsed) if parsed else time.time()
-
-
-def matches_keywords(entry):
-    text = (entry.get("title", "") + " " + entry.get("summary", "")).lower()
-    return any(k in text for k in KEYWORDS)
 
 
 def collect_items():
@@ -99,7 +159,7 @@ def collect_items():
             t = entry_time(entry)
             if t < cutoff:
                 continue
-            if needs_filter and not matches_keywords(entry):
+            if not is_relevant(title, entry.get("summary", "") if needs_filter else ""):
                 continue
             source = ""
             src = entry.get("source")
@@ -132,7 +192,7 @@ def merge(history, fresh):
             by_link[item["link"]] = item
             added += 1
     cutoff = time.time() - KEEP_DAYS * 86400
-    merged = [i for i in by_link.values() if i["time"] >= cutoff]
+    merged = [i for i in by_link.values() if i["time"] >= cutoff and is_relevant(i["title"])]
     merged.sort(key=lambda x: x["time"], reverse=True)
     return merged, added
 
